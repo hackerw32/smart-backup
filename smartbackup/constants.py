@@ -4,7 +4,7 @@ import os
 import sys
 
 APP_NAME = "Smart Backup"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 UPDATE_REPO = "hackerw32/smart-backup"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases/latest"
