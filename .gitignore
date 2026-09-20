@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+.venv/
+venv/
+
+config.json
+smart_backup.log
+smart_backup_failures.log
+*.log
