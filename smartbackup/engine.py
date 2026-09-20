@@ -22,6 +22,7 @@ from .constants import (
     MODE_PERIODIC_NO_RECYCLE,
 )
 from .i18n import Translator
+from .index import SyncIndex
 from .logging_setup import LOGGER
 
 try:
@@ -270,6 +271,16 @@ class BackupEngine:
         except OSError:
             return True
 
+    @staticmethod
+    def _needs_copy_st(dst, mtime, size):
+        try:
+            if not os.path.isfile(dst):
+                return True
+            dst_info = os.stat(dst)
+            return size != dst_info.st_size or mtime != int(dst_info.st_mtime)
+        except OSError:
+            return True
+
     def _copy_file(self, src, dst):
         if self._skip_name(os.path.basename(src)):
             return False
@@ -479,128 +490,39 @@ class BackupEngine:
                     "error",
                 )
                 return
-            tasks = []
-            last_scan_emit = 0.0
-            try:
-                for root, dirs, files in os.walk(source, topdown=True, onerror=self._walk_error):
-                    if self.stop_event.is_set():
-                        return
-                    dirs[:] = [
-                        d
-                        for d in dirs
-                        if not self.is_excluded(os.path.join(root, d))
-                        and not self._is_reparse(os.path.join(root, d))
-                    ]
-                    if self.is_excluded(root):
-                        continue
-                    rel_dir = self._rel(root)
-                    now = time.monotonic()
-                    if now - last_scan_emit >= 0.08:
-                        self._progress(
-                            phase="scan", current=rel_dir or ".", done=len(tasks), total=0
-                        )
-                        last_scan_emit = now
-                    if rel_dir:
-                        try:
-                            os.makedirs(os.path.join(backup, rel_dir), exist_ok=True)
-                        except OSError as exc:
-                            reason = classify_error(exc)
-                            self._record_failure(reason, rel_dir, str(exc))
-                            self.log(
-                                self.t(
-                                    "log.mkdir_rel_failed",
-                                    rel=rel_dir,
-                                    reason=self.t(reason),
-                                ),
-                                "error",
-                            )
-                    for name in files:
-                        full = os.path.join(root, name)
-                        if (
-                            self.is_excluded(full)
-                            or self._is_reparse(full)
-                            or self._skip_name(name)
-                        ):
-                            continue
-                        rel = self._rel(full)
-                        if rel is not None:
-                            tasks.append((full, rel))
-            except Exception:
-                self.log(self.t("log.scan_error", tb=traceback.format_exc()), "error")
+            index = SyncIndex(self.job.id)
+            manifest = index.load() if index.available else {}
+            baseline = not manifest
+            new_entries = []
+            tasks = self._scan_source(manifest, new_entries)
             total = len(tasks)
             self._progress(phase="copy", current="", done=0, total=total)
             copied = 0
-            for index, (full, rel) in enumerate(tasks, 1):
+            for position, (full, rel, is_new) in enumerate(tasks, 1):
                 if self.stop_event.is_set():
+                    index.close()
                     return
-                self._progress(phase="copy", current=rel, done=index, total=total)
+                self._progress(phase="copy", current=rel, done=position, total=total)
                 if self._copy_file(full, os.path.join(backup, rel)):
                     copied += 1
+                    if is_new:
+                        new_entries.append((rel, 0))
             deleted = 0
             removed = 0
+            self._progress(phase="delete", current="", done=0, total=0)
             try:
-                self._progress(phase="delete", current="", done=0, total=0)
-                last_del_emit = 0.0
-                if os.path.isdir(backup):
-                    for root, dirs, files in os.walk(
-                        backup, topdown=False, onerror=self._walk_error
-                    ):
-                        if self.stop_event.is_set():
-                            return
-                        if self._in_deleted_root(root):
-                            dirs[:] = []
-                            continue
-                        now = time.monotonic()
-                        if now - last_del_emit >= 0.08:
-                            self._progress(
-                                phase="delete",
-                                current=os.path.relpath(root, backup),
-                                done=deleted,
-                                total=0,
-                            )
-                            last_del_emit = now
-                        for name in files:
-                            mirror = os.path.join(root, name)
-                            if self._is_reparse(mirror):
-                                continue
-                            rel = os.path.relpath(mirror, backup)
-                            source_file = os.path.join(source, rel)
-                            if self._user_ignored(source_file):
-                                self._purge(
-                                    mirror, rel, is_dir=False, key="log.removed_ignored"
-                                )
-                                removed += 1
-                                continue
-                            if self.is_excluded(source_file):
-                                continue
-                            if not os.path.exists(source_file):
-                                self._move_to_deleted(mirror, rel, is_dir=False)
-                                deleted += 1
-                        for name in dirs:
-                            mirror_dir = os.path.join(root, name)
-                            if self._in_deleted_root(mirror_dir):
-                                continue
-                            rel = os.path.relpath(mirror_dir, backup)
-                            source_dir = os.path.join(source, rel)
-                            if self._user_ignored(source_dir):
-                                try:
-                                    if not os.listdir(mirror_dir):
-                                        os.rmdir(mirror_dir)
-                                except OSError:
-                                    pass
-                                continue
-                            if self.is_excluded(source_dir):
-                                continue
-                            if not os.path.isdir(source_dir):
-                                try:
-                                    if not os.listdir(mirror_dir):
-                                        os.rmdir(mirror_dir)
-                                except OSError:
-                                    pass
+                if baseline:
+                    deleted, removed = self._baseline_delete_scan(source, backup)
+                else:
+                    deleted, removed = self._manifest_delete(manifest, source, backup)
             except Exception:
                 self.log(
                     self.t("log.delete_check_error", tb=traceback.format_exc()), "error"
                 )
+            index.upsert(new_entries)
+            index.delete(list(manifest.keys()))
+            index.commit()
+            index.close()
             if self.stop_event.is_set():
                 return
             self._progress(phase="idle", current="", done=total, total=total)
@@ -624,6 +546,158 @@ class BackupEngine:
                     for reason, n in sorted(new_counts.items(), key=lambda item: -item[1])
                 )
                 self.log(self.t("log.run_failures", parts=parts), "warning")
+
+    def _scan_source(self, manifest, new_entries):
+        source = self.source()
+        backup = self.backup()
+        tasks = []
+        stack = [(source, "")]
+        last_emit = 0.0
+        while stack:
+            if self.stop_event.is_set():
+                return tasks
+            abs_dir, rel_dir = stack.pop()
+            try:
+                with os.scandir(abs_dir) as iterator:
+                    entries = list(iterator)
+            except OSError as exc:
+                self._walk_error(exc)
+                continue
+            for entry in entries:
+                if self.stop_event.is_set():
+                    return tasks
+                abspath = entry.path
+                if self.is_excluded(abspath) or self._is_reparse(abspath):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError as exc:
+                    self._walk_error(exc)
+                    continue
+                rel = os.path.join(rel_dir, entry.name) if rel_dir else entry.name
+                mirror = os.path.join(backup, rel)
+                if is_dir:
+                    if manifest.pop(rel, None) is None:
+                        new_entries.append((rel, 1))
+                        try:
+                            os.makedirs(mirror, exist_ok=True)
+                        except OSError as exc:
+                            reason = classify_error(exc)
+                            self._record_failure(reason, mirror, str(exc))
+                    stack.append((abspath, rel))
+                elif not self._skip_name(entry.name):
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        self._walk_error(exc)
+                        continue
+                    existed = manifest.pop(rel, None) is not None
+                    if self._needs_copy_st(mirror, int(info.st_mtime), info.st_size):
+                        tasks.append((abspath, rel, not existed))
+                    elif not existed:
+                        new_entries.append((rel, 0))
+            now = time.monotonic()
+            if now - last_emit >= 0.08:
+                self._progress(phase="scan", current=rel_dir or ".", done=len(tasks), total=0)
+                last_emit = now
+        return tasks
+
+    def _manifest_delete(self, manifest, source, backup):
+        deleted = 0
+        removed = 0
+        items = list(manifest.items())
+        for rel, is_dir in items:
+            if is_dir:
+                continue
+            source_path = os.path.join(source, rel)
+            mirror = os.path.join(backup, rel)
+            if self._user_ignored(source_path):
+                if os.path.isfile(mirror):
+                    self._purge(mirror, rel, is_dir=False, key="log.removed_ignored")
+                    removed += 1
+                continue
+            if os.path.isfile(mirror):
+                self._move_to_deleted(mirror, rel, is_dir=False)
+                deleted += 1
+        for rel, is_dir in items:
+            if not is_dir:
+                continue
+            source_path = os.path.join(source, rel)
+            mirror = os.path.join(backup, rel)
+            if self._user_ignored(source_path):
+                if os.path.isdir(mirror):
+                    self._purge(mirror, rel, is_dir=True, key="log.removed_ignored")
+                    removed += 1
+                continue
+            try:
+                if os.path.isdir(mirror) and not os.listdir(mirror):
+                    os.rmdir(mirror)
+            except OSError:
+                pass
+        return deleted, removed
+
+    def _baseline_delete_scan(self, source, backup):
+        deleted = 0
+        removed = 0
+        last_emit = 0.0
+        try:
+            if os.path.isdir(backup):
+                for root, dirs, files in os.walk(
+                    backup, topdown=False, onerror=self._walk_error
+                ):
+                    if self.stop_event.is_set():
+                        return deleted, removed
+                    if self._in_deleted_root(root):
+                        dirs[:] = []
+                        continue
+                    now = time.monotonic()
+                    if now - last_emit >= 0.08:
+                        self._progress(
+                            phase="delete",
+                            current=os.path.relpath(root, backup),
+                            done=deleted,
+                            total=0,
+                        )
+                        last_emit = now
+                    for name in files:
+                        mirror = os.path.join(root, name)
+                        if self._is_reparse(mirror):
+                            continue
+                        rel = os.path.relpath(mirror, backup)
+                        source_file = os.path.join(source, rel)
+                        if self._user_ignored(source_file):
+                            self._purge(mirror, rel, is_dir=False, key="log.removed_ignored")
+                            removed += 1
+                            continue
+                        if self.is_excluded(source_file):
+                            continue
+                        if not os.path.exists(source_file):
+                            self._move_to_deleted(mirror, rel, is_dir=False)
+                            deleted += 1
+                    for name in dirs:
+                        mirror_dir = os.path.join(root, name)
+                        if self._in_deleted_root(mirror_dir):
+                            continue
+                        rel = os.path.relpath(mirror_dir, backup)
+                        source_dir = os.path.join(source, rel)
+                        if self._user_ignored(source_dir):
+                            try:
+                                if not os.listdir(mirror_dir):
+                                    os.rmdir(mirror_dir)
+                            except OSError:
+                                pass
+                            continue
+                        if self.is_excluded(source_dir):
+                            continue
+                        if not os.path.isdir(source_dir):
+                            try:
+                                if not os.listdir(mirror_dir):
+                                    os.rmdir(mirror_dir)
+                            except OSError:
+                                pass
+        except Exception:
+            self.log(self.t("log.delete_check_error", tb=traceback.format_exc()), "error")
+        return deleted, removed
 
     def _submit(self, path):
         if not path:
