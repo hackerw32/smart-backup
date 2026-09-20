@@ -60,6 +60,10 @@ smartbackup/
   ui/                    # app, wizard, taskview, settings, failures
 ```
 
+## Νέα έκδοση
+
+Οδηγός βήμα-βήμα: [RELEASING.md](RELEASING.md).
+
 ## Άδεια
 
 MIT — δες [LICENSE](LICENSE).
